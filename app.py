@@ -1,88 +1,113 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import threading
 import requests
 import time
-import os
 import uuid
+import datetime
 
-app = Flask(__name__, static_folder='.')
+app = Flask(__name__)
 CORS(app)
 
-API_KEY = "ADMIN2026"
-# Lưu trữ trạng thái các task: True = Đang chạy, False = Tạm dừng
-task_states = {} 
+# ================= CƠ SỞ DỮ LIỆU (LƯU TRONG RAM) =================
+ADMIN_USER = "ngduclam"
+ADMIN_PASS = "ndl1201"
 
-def send_spam(task_id, token, channel_id, content, delay):
-    count = 0
-    while task_id in task_states: # Nếu task vẫn tồn tại trong danh sách
-        if task_states[task_id] == False: # Nếu đang bị tạm dừng
-            time.sleep(2) # Chờ 2 giây rồi kiểm tra lại
-            continue
-            
+USERS_DB = {
+    ADMIN_USER: {"password": ADMIN_PASS, "role": "admin"}
+}
+
+def send_spam(username, task_id, token, channel_id, content, delay):
+    while task_id in USERS_DB.get(username, {}).get("tasks", {}):
+        if USERS_DB[username]["tasks"][task_id] == False:
+            time.sleep(2); continue
         try:
             headers = {"Authorization": token, "Content-Type": "application/json"}
-            res = requests.post(
-                f"https://discord.com/api/v9/channels/{channel_id}/messages",
-                headers=headers,
-                json={"content": content}
-            )
+            res = requests.post(f"https://discord.com/api/v9/channels/{channel_id}/messages", headers=headers, json={"content": content})
             if res.status_code == 429:
-                time.sleep(5)
-                continue
-            if res.status_code == 401 or res.status_code == 403:
-                print(f"[LỖI] Token của task {task_id} chết.")
-                if task_id in task_states: del task_states[task_id]
+                time.sleep(5); continue
+            if res.status_code in [401, 403]:
+                if task_id in USERS_DB[username]["tasks"]: del USERS_DB[username]["tasks"][task_id]
                 break
-            
-            if res.status_code == 200:
-                count += 1
-                print(f"[OK] Task {task_id} - Đã gửi {count} tin nhắn.")
-                
             time.sleep(delay)
-        except Exception as e:
+        except:
             time.sleep(5)
 
-# API 1: Bắt đầu Task
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    device_id = data.get('device_id')
+
+    if username not in USERS_DB:
+        return jsonify({"error": "Tài khoản không tồn tại!"}), 401
+    
+    user = USERS_DB[username]
+    if user["password"] != password:
+        return jsonify({"error": "Sai mật khẩu!"}), 401
+
+    if username == ADMIN_USER:
+        return jsonify({"status": "success", "role": "admin", "username": username})
+
+    # Kiểm tra hạn
+    expire_date = datetime.datetime.strptime(user["expire_date"], "%Y-%m-%d")
+    if datetime.datetime.now() > expire_date:
+        return jsonify({"error": "Tài khoản đã hết hạn!"}), 403
+
+    # Kiểm tra thiết bị
+    if user["device_id"] is None:
+        user["device_id"] = device_id # Gắn thiết bị
+    elif user["device_id"] != device_id:
+        return jsonify({"error": "Tài khoản đã bị khóa trên thiết bị khác!"}), 403
+
+    return jsonify({"status": "success", "role": "user", "username": username})
+
 @app.route('/api/start', methods=['POST'])
 def start():
-    if request.headers.get('X-API-KEY') != API_KEY: return jsonify({"error": "Sai Key"}), 401
     data = request.json
+    username = data.get('username')
+    if username not in USERS_DB: return jsonify({"error": "Lỗi xác thực!"}), 401
     
     task_id = str(uuid.uuid4())[:8]
-    task_states[task_id] = True # True = Đang chạy
+    if "tasks" not in USERS_DB[username]: USERS_DB[username]["tasks"] = {}
     
-    threading.Thread(target=send_spam, args=(task_id, data['token'], data['channel'], data['message'], float(data['delay'])), daemon=True).start()
-    
+    USERS_DB[username]["tasks"][task_id] = True
+    threading.Thread(target=send_spam, args=(username, task_id, data['token'], data['channel'], data['message'], float(data['delay'])), daemon=True).start()
     return jsonify({"status": "success", "task_id": task_id})
 
-# API 2: Tạm dừng / Chạy tiếp
-@app.route('/api/toggle', methods=['POST'])
-def toggle():
-    if request.headers.get('X-API-KEY') != API_KEY: return jsonify({"error": "Sai Key"}), 401
-    task_id = request.json.get('task_id')
-    
-    if task_id in task_states:
-        task_states[task_id] = not task_states[task_id] # Đảo ngược trạng thái
-        return jsonify({"status": "success", "is_running": task_states[task_id]})
-    return jsonify({"error": "Không tìm thấy task"}), 404
+@app.route('/api/admin/users', methods=['GET'])
+def get_users():
+    res = []
+    for u, data in USERS_DB.items():
+        if u == ADMIN_USER: continue
+        res.append({"username": u, "device_id": data.get("device_id"), "expire_date": data.get("expire_date")})
+    return jsonify({"users": res})
 
-# API 3: Xóa Task
-@app.route('/api/delete', methods=['POST'])
-def delete():
-    if request.headers.get('X-API-KEY') != API_KEY: return jsonify({"error": "Sai Key"}), 401
-    task_id = request.json.get('task_id')
-    
-    if task_id in task_states:
-        del task_states[task_id] # Xóa khỏi danh sách -> vòng lặp tự dừng
+@app.route('/api/admin/create', methods=['POST'])
+def create_user():
+    data = request.json
+    u, p, days = data.get('username'), data.get('password'), int(data.get('days', 30))
+    if u in USERS_DB: return jsonify({"error": "Tài khoản đã tồn tại!"}), 400
+    expire = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    USERS_DB[u] = {"password": p, "device_id": None, "expire_date": expire, "tasks": {}}
+    return jsonify({"status": "success"})
+
+@app.route('/api/admin/reset_device', methods=['POST'])
+def reset_device():
+    u = request.json.get('username')
+    if u in USERS_DB:
+        USERS_DB[u]["device_id"] = None
         return jsonify({"status": "success"})
-    return jsonify({"error": "Không tìm thấy task"}), 404
+    return jsonify({"error": "Lỗi"}), 404
 
-@app.route('/')
-def index():
-    if os.path.exists('index.html'): return send_from_directory('.', 'index.html')
-    return "API đang chạy!"
+@app.route('/api/admin/delete', methods=['POST'])
+def delete_user():
+    u = request.json.get('username')
+    if u in USERS_DB and u != ADMIN_USER:
+        del USERS_DB[u]
+        return jsonify({"status": "success"})
+    return jsonify({"error": "Lỗi"}), 404
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=10000)
